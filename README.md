@@ -17,6 +17,29 @@ Want a TCP client that connects to 127.0.0.1 on port 8910?
 var client = new SimpleTcpClient().Connect("127.0.0.1", 8910);
 ```
 
+### Client connection state
+
+This fork exposes client connection state and transition events:
+
+```cs
+var client = new SimpleTcpClient();
+
+client.ConnectionStarted += (sender, args) => Console.WriteLine("Connected");
+client.ConnectionInterrupted += (sender, args) => Console.WriteLine("Connection lost unexpectedly");
+client.ConnectionClosed += (sender, args) => Console.WriteLine("Disconnected by the local client");
+
+client.Connect("127.0.0.1", 8910);
+
+if (client.IsConnected)
+{
+    // The socket is currently connected.
+}
+
+client.Disconnect();
+```
+
+`ConnectionStarted`, `ConnectionInterrupted`, and `ConnectionClosed` are emitted once per connection-state transition. `ConnectionInterrupted` is reserved for unexpected socket/remote-peer loss, while `ConnectionClosed` represents an intentional local `Disconnect()`.
+
 Want to send "Hello world!" to the server and get the reply that it sends within 3 seconds?
 
 ```cs
