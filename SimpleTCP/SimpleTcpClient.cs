@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Text;
@@ -23,22 +24,123 @@ namespace SimpleTCP
 		public byte Delimiter { get; set; }
 		public System.Text.Encoding StringEncoder { get; set; }
 		private TcpClient _client = null;
+		private readonly object _connectionStateLock = new object();
+		private bool _connectionActive;
 
 		public event EventHandler<Message> DelimiterDataReceived;
 		public event EventHandler<Message> DataReceived;
 		public event EventHandler ConnectionInterrupted;
 		public event EventHandler ConnectionStarted;
+		public event EventHandler ConnectionClosed;
 
-		public bool IsConnected => _client?.Connected ?? false;
+		public bool IsConnected
+		{
+			get { return IsSocketConnected(_client); }
+		}
 
-		private void NotifyConnectionInterrupted(TcpClient client, byte[] msg)
+		private static bool IsSocketConnected(TcpClient client)
 		{
-			ConnectionInterrupted?.Invoke(this, EventArgs.Empty);
+			if (client == null) { return false; }
+
+			try
+			{
+				Socket socket = client.Client;
+				if (socket == null || !socket.Connected) { return false; }
+
+				// TcpClient.Connected reflects the state of the last socket operation only.
+				// A readable socket with no available bytes indicates that the peer closed it.
+				return !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
+			}
+			catch (ObjectDisposedException)
+			{
+				return false;
+			}
+			catch (SocketException)
+			{
+				return false;
+			}
 		}
-		private void NotifyConnectionStarted(TcpClient client, byte[] msg)
+
+		private void NotifyConnectionStarted(TcpClient client)
 		{
-			ConnectionStarted?.Invoke(this, EventArgs.Empty);
+			bool notify = false;
+
+			lock (_connectionStateLock)
+			{
+				if (!ReferenceEquals(_client, client)) { return; }
+				if (!_connectionActive)
+				{
+					_connectionActive = true;
+					notify = true;
+				}
+			}
+
+			if (notify)
+			{
+				ConnectionStarted?.Invoke(this, EventArgs.Empty);
+			}
 		}
+
+		private void HandleConnectionInterrupted(TcpClient client)
+		{
+			bool notify = false;
+
+			lock (_connectionStateLock)
+			{
+				if (!ReferenceEquals(_client, client)) { return; }
+
+				_client = null;
+				if (_connectionActive)
+				{
+					_connectionActive = false;
+					notify = true;
+				}
+			}
+
+			try
+			{
+				client.Close();
+			}
+			catch
+			{
+			}
+
+			if (notify)
+			{
+				ConnectionInterrupted?.Invoke(this, EventArgs.Empty);
+			}
+		}
+
+		private void HandleConnectionClosed(TcpClient client)
+		{
+			bool notify = false;
+
+			lock (_connectionStateLock)
+			{
+				if (!ReferenceEquals(_client, client)) { return; }
+
+				_client = null;
+				if (_connectionActive)
+				{
+					_connectionActive = false;
+					notify = true;
+				}
+			}
+
+			try
+			{
+				client.Close();
+			}
+			catch
+			{
+			}
+
+			if (notify)
+			{
+				ConnectionClosed?.Invoke(this, EventArgs.Empty);
+			}
+		}
+
 		internal bool QueueStop { get; set; }
 		internal int ReadLoopIntervalMs { get; set; }
 		public bool AutoTrimStrings { get; set; }
@@ -50,9 +152,29 @@ namespace SimpleTCP
 				throw new ArgumentNullException("hostNameOrIpAddress");
 			}
 
-			_client = new TcpClient();
-			_client.Connect(hostNameOrIpAddress, port);
+			TcpClient client = new TcpClient();
+			client.Connect(hostNameOrIpAddress, port);
 
+			TcpClient previousClient = null;
+			lock (_connectionStateLock)
+			{
+				previousClient = _client;
+				_client = client;
+				_connectionActive = false;
+			}
+
+			if (previousClient != null)
+			{
+				try
+				{
+					previousClient.Close();
+				}
+				catch
+				{
+				}
+			}
+
+			NotifyConnectionStarted(client);
 			StartRxThread();
 
 			return this;
@@ -69,11 +191,10 @@ namespace SimpleTCP
 
 		public SimpleTcpClient Disconnect()
 		{
-			if (_client == null) { return this; }
-			NotifyConnectionInterrupted(_client, null);
-			flagNotifiedStarted = false;
-			_client.Close();
-			_client = null;
+			TcpClient client = _client;
+			if (client == null) { return this; }
+
+			HandleConnectionClosed(client);
 			return this;
 		}
 
@@ -89,7 +210,6 @@ namespace SimpleTCP
 				}
 				catch
 				{
-
 				}
 
 				System.Threading.Thread.Sleep(ReadLoopIntervalMs);
@@ -98,58 +218,65 @@ namespace SimpleTCP
 			_rxThread = null;
 		}
 
-
-		private bool flagNotifiedStarted = false;
 		private void RunLoopStep()
 		{
-			if (_client == null) { return; }
-			if (_client.Connected == false)
+			TcpClient c = _client;
+			if (c == null) { return; }
+
+			try
 			{
-				NotifyConnectionInterrupted(_client, null);
-				flagNotifiedStarted = false;
-				return;
-			}
-			else
-			{
-				if (!flagNotifiedStarted)
+				if (!IsSocketConnected(c))
 				{
-					NotifyConnectionStarted(_client, null);
-					flagNotifiedStarted = true;
+					HandleConnectionInterrupted(c);
+					return;
+				}
+
+				var delimiter = this.Delimiter;
+
+				int bytesAvailable = c.Available;
+				if (bytesAvailable == 0)
+				{
+					System.Threading.Thread.Sleep(10);
+					return;
+				}
+
+				List<byte> bytesReceived = new List<byte>();
+
+				while (c.Available > 0 && IsSocketConnected(c))
+				{
+					byte[] nextByte = new byte[1];
+					int received = c.Client.Receive(nextByte, 0, 1, SocketFlags.None);
+					if (received == 0)
+					{
+						HandleConnectionInterrupted(c);
+						break;
+					}
+
+					bytesReceived.AddRange(nextByte);
+					if (nextByte[0] == delimiter)
+					{
+						byte[] msg = _queuedMsg.ToArray();
+						_queuedMsg.Clear();
+						NotifyDelimiterMessageRx(c, msg);
+					}
+					else
+					{
+						_queuedMsg.AddRange(nextByte);
+					}
+				}
+
+				if (bytesReceived.Count > 0)
+				{
+					NotifyEndTransmissionRx(c, bytesReceived.ToArray());
 				}
 			}
-
-			var delimiter = this.Delimiter;
-			var c = _client;
-
-			int bytesAvailable = c.Available;
-			if (bytesAvailable == 0)
+			catch (ObjectDisposedException)
 			{
-				System.Threading.Thread.Sleep(10);
-				return;
+				HandleConnectionInterrupted(c);
 			}
-
-			List<byte> bytesReceived = new List<byte>();
-
-			while (c.Available > 0 && c.Connected)
+			catch (SocketException)
 			{
-				byte[] nextByte = new byte[1];
-				c.Client.Receive(nextByte, 0, 1, SocketFlags.None);
-				bytesReceived.AddRange(nextByte);
-				if (nextByte[0] == delimiter)
-				{
-					byte[] msg = _queuedMsg.ToArray();
-					_queuedMsg.Clear();
-					NotifyDelimiterMessageRx(c, msg);
-				}
-				else
-				{
-					_queuedMsg.AddRange(nextByte);
-				}
-			}
-
-			if (bytesReceived.Count > 0)
-			{
-				NotifyEndTransmissionRx(c, bytesReceived.ToArray());
+				HandleConnectionInterrupted(c);
 			}
 		}
 
@@ -173,8 +300,28 @@ namespace SimpleTCP
 
 		public void Write(byte[] data)
 		{
-			if (_client == null) { throw new Exception("Cannot send data to a null TcpClient (check to see if Connect was called)"); }
-			_client.GetStream().Write(data, 0, data.Length);
+			TcpClient client = _client;
+			if (client == null) { throw new Exception("Cannot send data to a null TcpClient (check to see if Connect was called)"); }
+
+			try
+			{
+				client.GetStream().Write(data, 0, data.Length);
+			}
+			catch (IOException)
+			{
+				HandleConnectionInterrupted(client);
+				throw;
+			}
+			catch (ObjectDisposedException)
+			{
+				HandleConnectionInterrupted(client);
+				throw;
+			}
+			catch (SocketException)
+			{
+				HandleConnectionInterrupted(client);
+				throw;
+			}
 		}
 
 		public void Write(string data)
@@ -221,42 +368,15 @@ namespace SimpleTCP
 		{
 			if (!disposedValue)
 			{
-				if (disposing)
-				{
-					// TODO: dispose managed state (managed objects).
-
-				}
-
-				// TODO: free unmanaged resources (unmanaged objects) and override a finalizer below.
-				// TODO: set large fields to null.
 				QueueStop = true;
-				if (_client != null)
-				{
-					try
-					{
-						_client.Close();
-					}
-					catch { }
-					_client = null;
-				}
-
+				Disconnect();
 				disposedValue = true;
 			}
 		}
 
-		// TODO: override a finalizer only if Dispose(bool disposing) above has code to free unmanaged resources.
-		// ~SimpleTcpClient() {
-		//   // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
-		//   Dispose(false);
-		// }
-
-		// This code added to correctly implement the disposable pattern.
 		public void Dispose()
 		{
-			// Do not change this code. Put cleanup code in Dispose(bool disposing) above.
 			Dispose(true);
-			// TODO: uncomment the following line if the finalizer is overridden above.
-			// GC.SuppressFinalize(this);
 		}
 		#endregion
 	}
